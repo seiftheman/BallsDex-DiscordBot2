@@ -7,7 +7,7 @@ import math
 import time
 import types
 from datetime import datetime
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Self, cast
 
 import aiohttp
 import discord
@@ -15,7 +15,11 @@ import discord.gateway
 from aiohttp import ClientTimeout
 from cachetools import TTLCache
 from discord import app_commands
-from discord.app_commands.translator import TranslationContextTypes, locale_str
+from discord.app_commands.translator import (
+    TranslationContextLocation,
+    TranslationContextTypes,
+    locale_str,
+)
 from discord.enums import Locale
 from discord.ext import commands
 from prometheus_client import Histogram
@@ -55,12 +59,19 @@ class Translator(app_commands.Translator):
     async def translate(
         self, string: locale_str, locale: Locale, context: TranslationContextTypes
     ) -> str | None:
-        return (
+        text = (
             string.message.replace("countryballs", settings.plural_collectible_name)
             .replace("countryball", settings.collectible_name)
             .replace("/balls", f"/{settings.players_group_cog_name}")
             .replace("BallsDex", settings.bot_name)
         )
+        if context.location in (
+            TranslationContextLocation.command_name,
+            TranslationContextLocation.group_name,
+        ):
+            text = text.replace(" ", "-").lower()
+
+        return text
 
 
 # observing the duration and status code of HTTP requests through aiohttp TraceConfig
@@ -131,7 +142,7 @@ class BallsDexBot(commands.AutoShardedBot):
     def __init__(
         self,
         command_prefix: PrefixType[BallsDexBot],
-        disable_messsage_content: bool = False,
+        disable_message_content: bool = False,
         disable_time_check: bool = False,
         skip_tree_sync: bool = False,
         dev: bool = False,
@@ -146,9 +157,9 @@ class BallsDexBot(commands.AutoShardedBot):
             guilds=True,
             guild_messages=True,
             emojis_and_stickers=True,
-            message_content=not disable_messsage_content,
+            message_content=not disable_message_content,
         )
-        if disable_messsage_content:
+        if disable_message_content:
             log.warning("Message content disabled, this will make spam detection harder")
 
         if settings.prometheus_enabled:
@@ -176,7 +187,7 @@ class BallsDexBot(commands.AutoShardedBot):
         self.command_log: set[int] = set()
         self.locked_balls = TTLCache(maxsize=99999, ttl=60 * 30)
 
-        self.owner_ids: set
+        self.owner_ids: set[int]
 
     async def start_prometheus_server(self):
         self.prometheus_server = PrometheusServer(
@@ -302,7 +313,7 @@ class BallsDexBot(commands.AutoShardedBot):
             if settings.team_owners:
                 self.owner_ids.update(m.id for m in self.application.team.members)
             else:
-                self.owner_ids.add(self.application.team.owner_id)
+                self.owner_ids.add(self.application.team.owner_id)  # type: ignore
         else:
             self.owner_ids.add(self.application.owner.id)
         if settings.co_owners:
@@ -371,7 +382,7 @@ class BallsDexBot(commands.AutoShardedBot):
             "is now operational![/green][/bold]\n"
         )
 
-    async def blacklist_check(self, interaction: discord.Interaction) -> bool:
+    async def blacklist_check(self, interaction: discord.Interaction[Self]) -> bool:
         if interaction.user.id in self.blacklist:
             if interaction.type != discord.InteractionType.autocomplete:
                 await interaction.response.send_message(
@@ -438,7 +449,7 @@ class BallsDexBot(commands.AutoShardedBot):
             )
 
     async def on_application_command_error(
-        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+        self, interaction: discord.Interaction[Self], error: app_commands.AppCommandError
     ):
         async def send(content: str):
             if interaction.response.is_done():

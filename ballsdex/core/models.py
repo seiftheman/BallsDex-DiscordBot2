@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Iterable, Tuple, Type
 
 import discord
 from discord.utils import format_dt
-from tortoise import exceptions, fields, models, signals, timezone, validators
+from tortoise import exceptions, fields, manager, models, signals, timezone, validators
 from tortoise.contrib.postgres.indexes import PostgreSQLIndex
 from tortoise.expressions import Q
 
@@ -17,6 +17,9 @@ from ballsdex.settings import settings
 
 if TYPE_CHECKING:
     from tortoise.backends.base.client import BaseDBAsyncClient
+    from tortoise.queryset import QuerySet
+
+    from ballsdex.core.bot import BallsDexBot
 
 
 balls: dict[int, Ball] = {}
@@ -199,6 +202,11 @@ Ball.register_listener(signals.Signals.pre_save, lower_catch_names)
 Ball.register_listener(signals.Signals.pre_save, lower_translations)
 
 
+class BallInstanceManager(manager.Manager):
+    def get_queryset(self) -> "QuerySet":
+        return super().get_queryset().filter(deleted=False)
+
+
 class BallInstance(models.Model):
     ball_id: int
     special_id: int
@@ -229,6 +237,11 @@ class BallInstance(models.Model):
         default=None,
     )
     extra_data = fields.JSONField(default={})
+    deleted = fields.BooleanField(
+        default=False, description="Whether this instance was deleted or not."
+    )
+
+    all_objects = manager.Manager()
 
     class Meta:
         unique_together = ("player", "id")
@@ -237,6 +250,7 @@ class BallInstance(models.Model):
             PostgreSQLIndex(fields=("player_id",)),
             PostgreSQLIndex(fields=("special_id",)),
         ]
+        manager = BallInstanceManager()
 
     @property
     def is_tradeable(self) -> bool:
@@ -328,16 +342,16 @@ class BallInstance(models.Model):
         return text
 
     def draw_card(self) -> BytesIO:
-        image = draw_card(self)
+        image, kwargs = draw_card(self)
         buffer = BytesIO()
-        image.save(buffer, format="png")
+        image.save(buffer, **kwargs)
         buffer.seek(0)
         image.close()
         return buffer
 
     async def prepare_for_message(
-        self, interaction: discord.Interaction
-    ) -> Tuple[str, discord.File]:
+        self, interaction: discord.Interaction["BallsDexBot"]
+    ) -> Tuple[str, discord.File, discord.ui.View]:
         # message content
         trade_content = ""
         await self.fetch_related("trade_player", "special")
@@ -365,9 +379,19 @@ class BallInstance(models.Model):
                 else f"user with ID {self.trade_player.discord_id}"
             )
             trade_content = f"Obtained by trade with {original_player_name}.\n"
+
+        catch_time: timedelta | None = (
+            self.catch_date - self.spawned_time
+            if (self.catch_date and self.spawned_time)
+            else None
+        )
+
+        catch_time_msg = f" in {catch_time.total_seconds():.3f}s" if catch_time else ""
+
         content = (
             f"ID: `#{self.pk:0X}`\n"
-            f"Caught on {format_dt(self.catch_date)} ({format_dt(self.catch_date, style='R')}).\n"
+            f"Caught on {format_dt(self.catch_date)}{catch_time_msg}"
+            f" ({format_dt(self.catch_date, style='R')}).\n"
             f"{trade_content}\n"
             f"ATK: {self.attack} ({self.attack_bonus:+d}%)\n"
             f"HP: {self.health} ({self.health_bonus:+d}%)"
@@ -377,7 +401,8 @@ class BallInstance(models.Model):
         with ThreadPoolExecutor() as pool:
             buffer = await interaction.client.loop.run_in_executor(pool, self.draw_card)
 
-        return content, discord.File(buffer, "card.png")
+        view = discord.ui.View()
+        return content, discord.File(buffer, "card.webp"), view
 
     async def lock_for_trade(self):
         self.locked = timezone.now()
@@ -417,6 +442,11 @@ class FriendPolicy(IntEnum):
     DENY = 2
 
 
+class TradeCooldownPolicy(IntEnum):
+    COOLDOWN = 1
+    BYPASS = 2
+
+
 class Player(models.Model):
     discord_id = fields.BigIntField(
         description="Discord user ID", unique=True, validators=[DiscordSnowflakeValidator()]
@@ -441,6 +471,12 @@ class Player(models.Model):
         description="How you want to handle friend requests",
         default=FriendPolicy.ALLOW,
     )
+    trade_cooldown_policy = fields.IntEnumField(
+        TradeCooldownPolicy,
+        description="How you want to handle trade accept cooldown",
+        default=TradeCooldownPolicy.COOLDOWN,
+    )
+    extra_data = fields.JSONField(default=dict)
     balls: fields.BackwardFKRelation[BallInstance]
 
     def __str__(self) -> str:

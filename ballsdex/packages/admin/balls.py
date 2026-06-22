@@ -24,7 +24,7 @@ from ballsdex.settings import settings
 
 if TYPE_CHECKING:
     from ballsdex.packages.countryballs.cog import CountryBallsSpawner
-    from ballsdex.packages.countryballs.countryball import CountryBall
+    from ballsdex.packages.countryballs.countryball import BallSpawnView
 
 log = logging.getLogger("ballsdex.packages.admin.balls")
 FILENAME_RE = re.compile(r"^(.+)(\.\S+)$")
@@ -51,7 +51,7 @@ class Balls(app_commands.Group):
     async def _spawn_bomb(
         self,
         interaction: discord.Interaction[BallsDexBot],
-        countryball_cls: type["CountryBall"],
+        countryball_cls: type["BallSpawnView"],
         countryball: Ball | None,
         channel: discord.TextChannel,
         n: int,
@@ -62,7 +62,6 @@ class Balls(app_commands.Group):
         spawned = 0
 
         async def update_message_loop():
-            nonlocal spawned
             for i in range(5 * 12 * 10):  # timeout progress after 10 minutes
                 await interaction.followup.edit_message(
                     "@original",  # type: ignore
@@ -82,9 +81,9 @@ class Balls(app_commands.Group):
         try:
             for i in range(n):
                 if not countryball:
-                    ball = await countryball_cls.get_random()
+                    ball = await countryball_cls.get_random(interaction.client)
                 else:
-                    ball = countryball_cls(countryball)
+                    ball = countryball_cls(interaction.client, countryball)
                 ball.special = special
                 ball.atk_bonus = atk_bonus
                 ball.hp_bonus = hp_bonus
@@ -158,6 +157,13 @@ class Balls(app_commands.Group):
             )
             return
 
+        special_attrs = []
+        if special is not None:
+            special_attrs.append(f"special={special.name}")
+        if atk_bonus is not None:
+            special_attrs.append(f"atk={atk_bonus}")
+        if hp_bonus is not None:
+            special_attrs.append(f"hp={hp_bonus}")
         if n > 1:
             await self._spawn_bomb(
                 interaction,
@@ -165,10 +171,14 @@ class Balls(app_commands.Group):
                 countryball,
                 channel or interaction.channel,  # type: ignore
                 n,
+                special,
+                atk_bonus,
+                hp_bonus,
             )
             await log_action(
                 f"{interaction.user} spawned {settings.collectible_name}"
-                f" {countryball or 'random'} {n} times in {channel or interaction.channel}.",
+                f" {countryball or 'random'} {n} times in {channel or interaction.channel}"
+                + (f" ({", ".join(special_attrs)})." if special_attrs else "."),
                 interaction.client,
             )
 
@@ -176,9 +186,9 @@ class Balls(app_commands.Group):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         if not countryball:
-            ball = await cog.countryball_cls.get_random()
+            ball = await cog.countryball_cls.get_random(interaction.client)
         else:
-            ball = cog.countryball_cls(countryball)
+            ball = cog.countryball_cls(interaction.client, countryball)
         ball.special = special
         ball.atk_bonus = atk_bonus
         ball.hp_bonus = hp_bonus
@@ -188,17 +198,10 @@ class Balls(app_commands.Group):
             await interaction.followup.send(
                 f"{settings.collectible_name.title()} spawned.", ephemeral=True
             )
-            special_attrs = []
-            if special is not None:
-                special_attrs.append(f"special={special.name}")
-            if atk_bonus is not None:
-                special_attrs.append(f"atk={atk_bonus}")
-            if hp_bonus is not None:
-                special_attrs.append(f"hp={hp_bonus}")
             await log_action(
                 f"{interaction.user} spawned {settings.collectible_name} {ball.name} "
                 f"in {channel or interaction.channel}"
-                f"{f" ({", ".join(special_attrs)})" if special_attrs else ""}.",
+                + (f" ({", ".join(special_attrs)})." if special_attrs else "."),
                 interaction.client,
             )
 
@@ -248,13 +251,17 @@ class Balls(app_commands.Group):
             special=special,
         )
         await interaction.followup.send(
-            f"`{countryball.country}` {settings.collectible_name} was successfully given to "
-            f"`{user}`.\nSpecial: `{special.name if special else None}` • ATK: "
-            f"`{instance.attack_bonus:+d}` • HP:`{instance.health_bonus:+d}` "
+            (
+                f"`{countryball.country}` `({instance.pk:0X})` "
+                f"{settings.collectible_name} was successfully given to `{user}`.\n"
+                f"Special: `{special.name if special else None}` • ATK: "
+                f"`{instance.attack_bonus:+d}` • HP:`{instance.health_bonus:+d}` "
+            )
         )
         await log_action(
             f"{interaction.user} gave {settings.collectible_name} "
-            f"{countryball.country} to {user}. (Special={special.name if special else None} "
+            f"{countryball.country} `({instance.pk:0X})` to {user}. "
+            f"(Special={special.name if special else None} "
             f"ATK={instance.attack_bonus:+d} HP={instance.health_bonus:+d}).",
             interaction.client,
         )
@@ -318,7 +325,10 @@ class Balls(app_commands.Group):
     @app_commands.command(name="delete")
     @app_commands.checks.has_any_role(*settings.root_role_ids)
     async def balls_delete(
-        self, interaction: discord.Interaction[BallsDexBot], countryball_id: str
+        self,
+        interaction: discord.Interaction[BallsDexBot],
+        countryball_id: str,
+        soft_delete: bool = True,
     ):
         """
         Delete a countryball.
@@ -327,6 +337,8 @@ class Balls(app_commands.Group):
         ----------
         countryball_id: str
             The ID of the countryball you want to delete.
+        soft_delete: bool
+            Whether the countryball should be kept in database or fully wiped.
         """
         try:
             ballIdConverted = int(countryball_id, 16)
@@ -342,11 +354,25 @@ class Balls(app_commands.Group):
                 f"The {settings.collectible_name} ID you gave does not exist.", ephemeral=True
             )
             return
-        await ball.delete()
-        await interaction.response.send_message(
-            f"{settings.collectible_name.title()} {countryball_id} deleted.", ephemeral=True
-        )
-        await log_action(f"{interaction.user} deleted {ball}({ball.pk}).", interaction.client)
+        if soft_delete:
+            ball.deleted = True
+            await ball.save()
+            await interaction.response.send_message(
+                f"{settings.collectible_name.title()} {countryball_id} soft deleted.",
+                ephemeral=True,
+            )
+            await log_action(
+                f"{interaction.user} soft deleted {ball}({ball.pk}).", interaction.client
+            )
+        else:
+            await ball.delete()
+            await interaction.response.send_message(
+                f"{settings.collectible_name.title()} {countryball_id} hard deleted.",
+                ephemeral=True,
+            )
+            await log_action(
+                f"{interaction.user} hard deleted {ball}({ball.pk}).", interaction.client
+            )
 
     @app_commands.command(name="transfer")
     @app_commands.checks.has_any_role(*settings.root_role_ids)
@@ -403,6 +429,7 @@ class Balls(app_commands.Group):
         interaction: discord.Interaction[BallsDexBot],
         user: discord.User,
         percentage: int | None = None,
+        soft_delete: bool = True,
     ):
         """
         Reset a player's countryballs.
@@ -413,6 +440,9 @@ class Balls(app_commands.Group):
             The user you want to reset the countryballs of.
         percentage: int | None
             The percentage of countryballs to delete, if not all. Used for sanctions.
+        soft_delete: bool
+            If true, the countryballs will be marked as deleted instead of being removed from the
+            database.
         """
         player = await Player.get_or_none(discord_id=user.id)
         if not player:
@@ -427,16 +457,21 @@ class Balls(app_commands.Group):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
 
+        method = "soft" if soft_delete else "hard"
         if not percentage:
-            text = f"Are you sure you want to delete {user}'s {settings.plural_collectible_name}?"
+            text = (
+                f"Are you sure you want to {method} delete {user}'s "
+                f"{settings.plural_collectible_name}?"
+            )
         else:
             text = (
-                f"Are you sure you want to delete {percentage}% of "
+                f"Are you sure you want to {method} delete {percentage}% of "
                 f"{user}'s {settings.plural_collectible_name}?"
             )
         view = ConfirmChoiceView(
             interaction,
-            accept_message=f"Confirmed, deleting the {settings.plural_collectible_name}...",
+            accept_message=f"Confirmed, {method} deleting the "
+            f"{settings.plural_collectible_name}...",
             cancel_message="Request cancelled.",
         )
         await interaction.followup.send(
@@ -451,16 +486,23 @@ class Balls(app_commands.Group):
             balls = await BallInstance.filter(player=player)
             to_delete = random.sample(balls, int(len(balls) * (percentage / 100)))
             for ball in to_delete:
-                await ball.delete()
+                if soft_delete:
+                    ball.deleted = True
+                    await ball.save()
+                else:
+                    await ball.delete()
             count = len(to_delete)
         else:
-            count = await BallInstance.filter(player=player).delete()
+            if soft_delete:
+                count = await BallInstance.filter(player=player).update(deleted=True)
+            else:
+                count = await BallInstance.filter(player=player).delete()
         await interaction.followup.send(
-            f"{count} {settings.plural_collectible_name} from {user} have been deleted.",
+            f"{count} {settings.plural_collectible_name} from {user} have been {method} deleted.",
             ephemeral=True,
         )
         await log_action(
-            f"{interaction.user} deleted {percentage or 100}% of "
+            f"{interaction.user} {method} deleted {percentage or 100}% of "
             f"{player}'s {settings.plural_collectible_name}.",
             interaction.client,
         )
@@ -473,6 +515,7 @@ class Balls(app_commands.Group):
         user: discord.User | None = None,
         countryball: BallTransform | None = None,
         special: SpecialTransform | None = None,
+        deleted: bool = False,
     ):
         """
         Count the number of countryballs that a player has or how many exist in total.
@@ -483,6 +526,8 @@ class Balls(app_commands.Group):
             The user you want to count the countryballs of.
         countryball: Ball
         special: Special
+        deleted: bool
+            Include soft deleted countryballs
         """
         if interaction.response.is_done():
             return
@@ -494,7 +539,8 @@ class Balls(app_commands.Group):
         if user:
             filters["player__discord_id"] = user.id
         await interaction.response.defer(ephemeral=True, thinking=True)
-        balls = await BallInstance.filter(**filters).count()
+        qs = BallInstance.all_objects if deleted else BallInstance
+        balls = await qs.filter(**filters).count()
         verb = "is" if balls == 1 else "are"
         country = f"{countryball.country} " if countryball else ""
         plural = "s" if balls > 1 or balls == 0 else ""
@@ -613,8 +659,8 @@ class Balls(app_commands.Group):
                 enabled=enabled,
                 tradeable=tradeable,
                 emoji_id=emoji_id,
-                wild_card="/" + str(wild_card_path),
-                collection_card="/" + str(collection_card_path),
+                wild_card=str(wild_card_path),
+                collection_card=str(collection_card_path),
                 credits=image_credits,
                 capacity_name=capacity_name,
                 capacity_description=capacity_description,
@@ -644,3 +690,4 @@ class Balls(app_commands.Group):
                 f"{health=} {attack=} {rarity=} {enabled=} {tradeable=} emoji={emoji}",
                 files=files,
             )
+            log.info(f'{interaction.user} has created the {settings.collectible_name} "{name}"')
